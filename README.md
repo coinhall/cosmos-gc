@@ -21,3 +21,6 @@ du -sh ./*
 3.3T    ./tx_index.db
 4.0K    ./upgrade-info.json
 ```
+
+- Latest block height must be read from each database (ie. cannot read from one db and assume it's the same for all)
+- `state.db` must contain all data with the `validatorsKey:` prefix, else starting the daemon will result in consensus failure
