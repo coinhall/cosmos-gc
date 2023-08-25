@@ -150,7 +150,7 @@ func PruneStateDB(dataDir string) {
 
 	// Get latest height
 	fmt.Printf("Finding latest block height...\n")
-	prefix := []byte("abciResponsesKey:")
+	prefix := []byte("validatorsKey:")
 	latestHeight := uint64(0)
 	iter := dbCurrent.NewIterator(util.BytesPrefix(prefix), nil)
 	for iter.Next() {
@@ -175,9 +175,9 @@ func PruneStateDB(dataDir string) {
 		panic(err)
 	}
 	var (
-		abciResponsesKey    []byte = []byte("abciResponsesKey:" + fmt.Sprint(latestHeight))
+		abciResponsesKey    []byte = []byte("abciResponsesKey:" + fmt.Sprint(latestHeight-2))
 		abciResponsesVal    []byte
-		consensusParamsKey  []byte = []byte("consensusParamsKey:" + fmt.Sprint(latestHeight+1))
+		consensusParamsKey  []byte = []byte("consensusParamsKey:" + fmt.Sprint(latestHeight-1))
 		consensusParamsVal  []byte
 		validatorsKey       []byte = []byte("validatorsKey:")
 		genesisDocKey       []byte = []byte("genesisDoc")
