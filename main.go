@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -151,12 +152,16 @@ func PruneStateDB(dataDir string) {
 	// Get latest height
 	fmt.Printf("Finding latest block height...\n")
 	prefix := []byte("validatorsKey:")
+	lowestHeight := uint64(math.MaxUint64)
 	latestHeight := uint64(0)
 	iter := dbCurrent.NewIterator(util.BytesPrefix(prefix), nil)
 	for iter.Next() {
 		height, err := strconv.ParseUint(string(iter.Key())[len(prefix):], 10, 64)
 		if err != nil {
 			panic(err)
+		}
+		if height < lowestHeight {
+			lowestHeight = height
 		}
 		if height > latestHeight {
 			latestHeight = height
@@ -179,7 +184,6 @@ func PruneStateDB(dataDir string) {
 		abciResponsesVal    []byte
 		consensusParamsKey  []byte = []byte("consensusParamsKey:" + fmt.Sprint(latestHeight-1))
 		consensusParamsVal  []byte
-		validatorsKey       []byte = []byte("validatorsKey:")
 		genesisDocKey       []byte = []byte("genesisDoc")
 		genesisDocVal       []byte
 		lastABCIResponseKey []byte = []byte("lastABCIResponseKey")
@@ -207,17 +211,27 @@ func PruneStateDB(dataDir string) {
 	if err != nil {
 		panic(err)
 	}
+	// ! we need to get the first height of a hard fork
+	// ! the first ever key found in the db might be wrong
+	firstValidatorsVal, err := dbCurrent.Get([]byte("validatorsKey:"+fmt.Sprint(lowestHeight)), nil)
+	if err != nil {
+		panic(err)
+	}
 	batch := new(leveldb.Batch)
 	batch.Put(abciResponsesKey, abciResponsesVal)
 	batch.Put(consensusParamsKey, consensusParamsVal)
 	batch.Put(genesisDocKey, genesisDocVal)
 	batch.Put(lastABCIResponseKey, lastABCIResponseVal)
 	batch.Put(stateKey, stateVal)
-	iter = dbCurrent.NewIterator(util.BytesPrefix(validatorsKey), nil)
-	for iter.Next() {
-		batch.Put(iter.Key(), iter.Value())
+	batch.Put([]byte("validatorsKey:"+fmt.Sprint(lowestHeight)), firstValidatorsVal)
+	for i := 0; i <= 2; i++ {
+		key := []byte("validatorsKey:" + fmt.Sprint(latestHeight-uint64(i)))
+		val, err := dbCurrent.Get(key, nil)
+		if err != nil {
+			panic(err)
+		}
+		batch.Put(key, val)
 	}
-	iter.Release()
 	if err := dbNew.Write(batch, nil); err != nil {
 		panic(err)
 	}
