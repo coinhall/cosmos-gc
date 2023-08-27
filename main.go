@@ -14,13 +14,11 @@ import (
 	storeiavl "github.com/cosmos/cosmos-sdk/store/iavl"
 	"github.com/cosmos/cosmos-sdk/store/rootmulti"
 	sdk "github.com/cosmos/cosmos-sdk/store/types"
-	gogotypes "github.com/cosmos/gogoproto/types"
 	"github.com/cosmos/iavl"
-	"github.com/syndtr/goleveldb/leveldb"
 )
 
 func PruneBlockstoreDB(dataDir string) {
-	fmt.Printf("=== Pruning blockstore.db ===\n")
+	fmt.Printf("\n========= Pruning blockstore.db =========\n")
 
 	dbOld, err := cosmosdb.NewGoLevelDB("blockstore", dataDir)
 	if err != nil {
@@ -115,11 +113,11 @@ func PruneBlockstoreDB(dataDir string) {
 	if err := os.Rename(filepath.Join(dataDir, "blockstore.new.db"), filepath.Join(dataDir, "blockstore.db")); err != nil {
 		panic(err)
 	}
-	fmt.Printf("Successfully pruned blockstore.db!\n\n")
+	fmt.Printf("Successfully pruned blockstore.db!\n")
 }
 
 func PruneStateDB(dataDir string) {
-	fmt.Printf("=== Pruning state.db ===\n")
+	fmt.Printf("\n========= Pruning state.db =========\n")
 
 	dbOld, err := cosmosdb.NewGoLevelDB("state", dataDir)
 	if err != nil {
@@ -197,55 +195,44 @@ func PruneStateDB(dataDir string) {
 	if err := os.Rename(filepath.Join(dataDir, "state.new.db"), filepath.Join(dataDir, "state.db")); err != nil {
 		panic(err)
 	}
-	fmt.Printf("Successfully pruned state.db!\n\n")
+	fmt.Printf("Successfully pruned state.db!\n")
 }
 
 func PruneApplicationDB(dataDir string) {
-	fmt.Printf("=== Pruning application.db ===\n")
+	fmt.Printf("\n========= Pruning application.db =========\n")
 
-	// Get all iavl keys by iterating through the whole db
-	fmt.Printf("Finding all module keys...\n")
-	ldb, err := leveldb.OpenFile(filepath.Join(dataDir, "application.db"), nil)
-	if err != nil {
-		panic(err)
-	}
-	iter := ldb.NewIterator(nil, nil)
-	set := make(map[string]struct{})
-	// TODO: can be alot more efficient instead of looping through everything
-	for iter.Next() {
-		key := string(iter.Key())
-		if strings.HasPrefix(key, "s/k:") {
-			key = strings.Replace(key, "s/k:", "", 1)
-			split := strings.Split(key, "/")
-			key = split[0]
-			set[key] = struct{}{}
-		}
-	}
-	keys := []string{}
-	for key := range set {
-		keys = append(keys, key)
-	}
-	iter.Release()
-	ldb.Close()
-	fmt.Printf("Found [%v] module keys\n", len(keys))
-
-	// Get latest height
-	fmt.Printf("Finding latest block height...\n")
 	cdbOld, err := cosmosdb.NewGoLevelDB("application", dataDir)
 	if err != nil {
 		panic(err)
 	}
-	val, err := cdbOld.Get([]byte("s/latest"))
+
+	// Get latest height
+	fmt.Printf("Finding latest block height...\n")
+	latestHeight := rootmulti.GetLatestVersion(cdbOld)
+	fmt.Printf("Latest block height [%v]\n", latestHeight)
+
+	// Get all module keys
+	fmt.Printf("Finding all module keys...\n")
+	storeOld := rootmulti.NewStore(cdbOld, log.NewNopLogger())
+	commitInfo, err := storeOld.GetCommitInfo(latestHeight)
 	if err != nil {
 		panic(err)
 	}
-	latestHeight := int64(0)
-	if val != nil {
-		if err := gogotypes.StdInt64Unmarshal(&latestHeight, val); err != nil {
-			panic(err)
-		}
+	storeKeys := make([]*sdk.KVStoreKey, len(commitInfo.StoreInfos))
+	for i, info := range commitInfo.StoreInfos {
+		storeKeys[i] = sdk.NewKVStoreKey(info.Name)
 	}
-	fmt.Printf("Latest block height [%v]\n", latestHeight)
+	fmt.Printf("Found [%v] module keys\n", len(storeKeys))
+
+	// Initialise old store
+	fmt.Printf("Initialising old store with module keys...\n")
+	for _, storeKey := range storeKeys {
+		storeOld.MountStoreWithDB(storeKey, sdk.StoreTypeIAVL, nil)
+	}
+	if err := storeOld.LoadLatestVersion(); err != nil {
+		panic(err)
+	}
+	fmt.Printf("Successfully initialised old store...\n")
 
 	// Create new db and import latest version from old db
 	fmt.Printf("Creating new db and adding latest info from old db...\n")
@@ -256,22 +243,7 @@ func PruneApplicationDB(dataDir string) {
 	if err != nil {
 		panic(err)
 	}
-
-	storeOld := rootmulti.NewStore(cdbOld, log.NewNopLogger())
 	storeNew := rootmulti.NewStore(cdbNew, log.NewNopLogger())
-	if err != nil {
-		panic(err)
-	}
-	storeKeys := []*sdk.KVStoreKey{}
-	for _, key := range keys {
-		storeKeys = append(storeKeys, sdk.NewKVStoreKey(key))
-	}
-	for _, storeKey := range storeKeys {
-		storeOld.MountStoreWithDB(storeKey, sdk.StoreTypeIAVL, nil)
-	}
-	if err := storeOld.LoadLatestVersion(); err != nil {
-		panic(err)
-	}
 	for _, storeKey := range storeKeys {
 		storeNew.MountStoreWithDB(storeKey, sdk.StoreTypeIAVL, nil)
 	}
@@ -283,12 +255,12 @@ func PruneApplicationDB(dataDir string) {
 		kvStoreOld := storeOld.GetCommitKVStore(storeKey)
 		exp, err := kvStoreOld.(*storeiavl.Store).Export(latestHeight)
 		if err != nil {
-			// error will be thrown when tree root is null
-			// we should set it back to null in the new db
-			b := make([]byte, 8)
-			binary.BigEndian.PutUint64(b, uint64(latestHeight))
-			key := append([]byte("s/k:"+storeKey.Name()+"/r"), b...)
-			if err := cdbNew.SetSync(key, []byte{}); err != nil {
+			// error will be thrown when tree root is null for a given height
+			// we should set it back to empty bytes in the new store
+			binaryHeight := make([]byte, 8)
+			binary.BigEndian.PutUint64(binaryHeight, uint64(latestHeight))
+			key := append([]byte("s/k:"+storeKey.Name()+"/r"), binaryHeight...)
+			if err := cdbNew.Set(key, []byte{}); err != nil {
 				panic(err)
 			}
 			continue
@@ -313,12 +285,17 @@ func PruneApplicationDB(dataDir string) {
 	}
 
 	// Copy latest height and commit info
-	cdbNew.SetSync([]byte("s/latest"), val)
-	for i := 1; i <= int(latestHeight); i++ {
-		commitInfo, _ := cdbOld.Get([]byte("s/" + fmt.Sprint(i)))
-		cdbNew.SetSync([]byte("s/"+fmt.Sprint(i)), commitInfo)
+	val, err := cdbOld.Get([]byte("s/latest"))
+	if err != nil {
+		panic(err)
 	}
-	fmt.Printf("Successfully added latest info to new application.db\n")
+	cdbNew.SetSync([]byte("s/latest"), val)
+	val, err = commitInfo.Marshal()
+	if err != nil {
+		panic(err)
+	}
+	cdbNew.SetSync([]byte("s/"+fmt.Sprint(latestHeight)), val)
+	fmt.Printf("Successfully added latest info to new db\n")
 
 	// Remove old db and rename new db
 	fmt.Printf("Removing old db and renaming new db...\n")
@@ -334,7 +311,7 @@ func PruneApplicationDB(dataDir string) {
 	if err := os.Rename(filepath.Join(dataDir, "application.new.db"), filepath.Join(dataDir, "application.db")); err != nil {
 		panic(err)
 	}
-	fmt.Printf("Successfully pruned application.db!\n\n")
+	fmt.Printf("Successfully pruned application.db!\n")
 }
 
 func main() {
@@ -344,7 +321,7 @@ func main() {
 	}
 	appHome := os.Args[1]
 	dataDir := filepath.Join(appHome, "data")
-	fmt.Printf("Using app data dir at [%v]\n\n", dataDir)
+	fmt.Printf("Using app data dir at [%v]\n", dataDir)
 
 	PruneBlockstoreDB(dataDir)
 	PruneStateDB(dataDir)
