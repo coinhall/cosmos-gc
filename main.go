@@ -7,20 +7,21 @@ import (
 	"path/filepath"
 	"strings"
 
-	cosmosdb "github.com/cometbft/cometbft-db"
+	cdb "github.com/cometbft/cometbft-db"
 	"github.com/cometbft/cometbft/libs/log"
+	cmtstate "github.com/cometbft/cometbft/proto/tendermint/state"
 	"github.com/cometbft/cometbft/state"
 	"github.com/cometbft/cometbft/store"
 	storeiavl "github.com/cosmos/cosmos-sdk/store/iavl"
 	"github.com/cosmos/cosmos-sdk/store/rootmulti"
-	sdk "github.com/cosmos/cosmos-sdk/store/types"
+	storetypes "github.com/cosmos/cosmos-sdk/store/types"
 	"github.com/cosmos/iavl"
 )
 
 func PruneBlockstoreDB(dataDir string) {
 	fmt.Printf("\n========= Pruning blockstore.db =========\n")
 
-	dbOld, err := cosmosdb.NewGoLevelDB("blockstore", dataDir)
+	dbOld, err := cdb.NewGoLevelDB("blockstore", dataDir)
 	if err != nil {
 		panic(err)
 	}
@@ -42,7 +43,7 @@ func PruneBlockstoreDB(dataDir string) {
 	if err := os.RemoveAll(filepath.Join(dataDir, "blockstore.new.db")); err != nil {
 		panic(err)
 	}
-	dbNew, err := cosmosdb.NewGoLevelDB("blockstore.new", dataDir)
+	dbNew, err := cdb.NewGoLevelDB("blockstore.new", dataDir)
 	if err != nil {
 		panic(err)
 	}
@@ -119,64 +120,57 @@ func PruneBlockstoreDB(dataDir string) {
 func PruneStateDB(dataDir string) {
 	fmt.Printf("\n========= Pruning state.db =========\n")
 
-	dbOld, err := cosmosdb.NewGoLevelDB("state", dataDir)
+	dbOld, err := cdb.NewGoLevelDB("state", dataDir)
 	if err != nil {
 		panic(err)
 	}
 
-	// Get latest height
-	fmt.Printf("Finding latest and initial block heights...\n")
+	// Get the important heights
+	fmt.Printf("Finding important block heights...\n")
 	storeOld := state.NewStore(dbOld, state.StoreOptions{})
 	storeStateOld, err := storeOld.Load()
 	if err != nil {
 		panic(err)
 	}
-	initialheight := storeStateOld.InitialHeight
 	latestHeight := storeStateOld.LastBlockHeight
-	fmt.Printf("Initial block height [%v]\n", initialheight)
-	fmt.Printf("Latest block height [%v]\n", latestHeight)
+	lastValHeight := storeStateOld.LastHeightValidatorsChanged
+	if lastValHeight > latestHeight {
+		// If lastValHeight is greater than latestHeight, then we need to find the lastValHeight
+		// by looking at the validators info at latestHeight-1
+		bytes, err := dbOld.Get([]byte("validatorsKey:" + fmt.Sprint(latestHeight-1)))
+		if err != nil {
+			panic(err)
+		}
+		if len(bytes) > 0 {
+			valInfo := new(cmtstate.ValidatorsInfo)
+			if err := valInfo.Unmarshal(bytes); err != nil {
+				panic(err)
+			}
+			lastValHeight = valInfo.LastHeightChanged
+		}
+	}
+	fmt.Printf("Latest block height        [%v]\n", latestHeight)
+	fmt.Printf("Last valset height changed [%v]\n", lastValHeight)
 
 	// Create new db and populate latest info
 	fmt.Printf("Creating new db and adding latest info from old db...\n")
 	if err := os.RemoveAll(filepath.Join(dataDir, "state.new.db")); err != nil {
 		panic(err)
 	}
-	dbNew, err := cosmosdb.NewGoLevelDB("state.new", dataDir)
+	dbNew, err := cdb.NewGoLevelDB("state.new", dataDir)
 	if err != nil {
 		panic(err)
 	}
 	storeNew := state.NewStore(dbNew, state.StoreOptions{})
-	if err := storeNew.Save(storeStateOld); err != nil {
+	if err := storeNew.Bootstrap(storeStateOld); err != nil {
 		panic(err)
 	}
-	var (
-		validatorsKey0 []byte = []byte("validatorsKey:" + fmt.Sprint(initialheight))
-		validatorsVal0 []byte
-		validatorsKey1 []byte = []byte("validatorsKey:" + fmt.Sprint(latestHeight))
-		validatorsVal1 []byte
-		validatorsKey2 []byte = []byte("validatorsKey:" + fmt.Sprint(latestHeight+1))
-		validatorsVal2 []byte
-	)
-	validatorsVal0, err = dbOld.Get(validatorsKey0)
+	valKey := []byte("validatorsKey:" + fmt.Sprint(lastValHeight))
+	valBytes, err := dbOld.Get(valKey)
 	if err != nil {
 		panic(err)
 	}
-	validatorsVal1, err = dbOld.Get(validatorsKey1)
-	if err != nil {
-		panic(err)
-	}
-	validatorsVal2, err = dbOld.Get(validatorsKey2)
-	if err != nil {
-		panic(err)
-	}
-	batch := dbNew.NewBatch()
-	batch.Set(validatorsKey0, validatorsVal0)
-	batch.Set(validatorsKey1, validatorsVal1)
-	batch.Set(validatorsKey2, validatorsVal2)
-	if err := batch.WriteSync(); err != nil {
-		panic(err)
-	}
-	if err := batch.Close(); err != nil {
+	if err := dbNew.SetSync(valKey, valBytes); err != nil {
 		panic(err)
 	}
 	fmt.Printf("Successfully added latest info to new db\n")
@@ -201,7 +195,7 @@ func PruneStateDB(dataDir string) {
 func PruneApplicationDB(dataDir string) {
 	fmt.Printf("\n========= Pruning application.db =========\n")
 
-	cdbOld, err := cosmosdb.NewGoLevelDB("application", dataDir)
+	cdbOld, err := cdb.NewGoLevelDB("application", dataDir)
 	if err != nil {
 		panic(err)
 	}
@@ -218,16 +212,20 @@ func PruneApplicationDB(dataDir string) {
 	if err != nil {
 		panic(err)
 	}
-	storeKeys := make([]*sdk.KVStoreKey, len(commitInfo.StoreInfos))
-	for i, info := range commitInfo.StoreInfos {
-		storeKeys[i] = sdk.NewKVStoreKey(info.Name)
+	storeKeys := []*storetypes.KVStoreKey{}
+	for _, info := range commitInfo.StoreInfos {
+		// Skip stores that are not of type `sdk.StoreTypeIAVL`
+		if strings.HasPrefix(info.Name, "mem_") {
+			continue
+		}
+		storeKeys = append(storeKeys, storetypes.NewKVStoreKey(info.Name))
 	}
 	fmt.Printf("Found [%v] module keys\n", len(storeKeys))
 
 	// Initialise old store
 	fmt.Printf("Initialising old store with module keys...\n")
 	for _, storeKey := range storeKeys {
-		storeOld.MountStoreWithDB(storeKey, sdk.StoreTypeIAVL, nil)
+		storeOld.MountStoreWithDB(storeKey, storetypes.StoreTypeIAVL, nil)
 	}
 	if err := storeOld.LoadLatestVersion(); err != nil {
 		panic(err)
@@ -239,13 +237,13 @@ func PruneApplicationDB(dataDir string) {
 	if err := os.RemoveAll(filepath.Join(dataDir, "application.new.db")); err != nil {
 		panic(err)
 	}
-	cdbNew, err := cosmosdb.NewGoLevelDB("application.new", dataDir)
+	cdbNew, err := cdb.NewGoLevelDB("application.new", dataDir)
 	if err != nil {
 		panic(err)
 	}
 	storeNew := rootmulti.NewStore(cdbNew, log.NewNopLogger())
 	for _, storeKey := range storeKeys {
-		storeNew.MountStoreWithDB(storeKey, sdk.StoreTypeIAVL, nil)
+		storeNew.MountStoreWithDB(storeKey, storetypes.StoreTypeIAVL, nil)
 	}
 	if err := storeNew.LoadLatestVersion(); err != nil {
 		panic(err)
@@ -260,7 +258,7 @@ func PruneApplicationDB(dataDir string) {
 			binaryHeight := make([]byte, 8)
 			binary.BigEndian.PutUint64(binaryHeight, uint64(latestHeight))
 			key := append([]byte("s/k:"+storeKey.Name()+"/r"), binaryHeight...)
-			if err := cdbNew.Set(key, []byte{}); err != nil {
+			if err := cdbNew.SetSync(key, []byte{}); err != nil {
 				panic(err)
 			}
 			continue

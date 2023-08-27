@@ -23,6 +23,6 @@ du -sh ./*
 ```
 
 - Latest block height must be read from each database (ie. cannot read from one db and assume it's the same for all)
-- `state.db` must contain `validatorsKey` for initial height, latest height, latest height + 1, and latest height + 2; else, starting the daemon will result in consensus failure
+- `state.db` must contain `validatorsKey` for last valset changed height, latest height, latest height + 1, and latest height + 2; else, starting the daemon will result in consensus failure
 - `application.db` holds the AVL tree for Cosmos SDK, iteration itself is already very expensive (worse still for reads and writes)
 - Tested (and working) for chains using Cosmos SDK versions 0.46 and 0.47
