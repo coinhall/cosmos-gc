@@ -11,12 +11,10 @@ import (
 
 	cosmosdb "github.com/cometbft/cometbft-db"
 	"github.com/cometbft/cometbft/libs/log"
-	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
-	"github.com/cometbft/cometbft/types"
+	"github.com/cometbft/cometbft/store"
 	storeiavl "github.com/cosmos/cosmos-sdk/store/iavl"
 	"github.com/cosmos/cosmos-sdk/store/rootmulti"
 	sdk "github.com/cosmos/cosmos-sdk/store/types"
-	"github.com/cosmos/gogoproto/proto"
 	gogotypes "github.com/cosmos/gogoproto/types"
 	"github.com/cosmos/iavl"
 	"github.com/syndtr/goleveldb/leveldb"
@@ -26,51 +24,29 @@ import (
 func PruneBlockstoreDB(dataDir string) {
 	fmt.Printf("=== Pruning blockstore.db ===\n")
 
-	dbCurrent, err := leveldb.OpenFile(filepath.Join(dataDir, "blockstore.db"), nil)
+	dbOld, err := cosmosdb.NewGoLevelDB("blockstore", dataDir)
 	if err != nil {
 		panic(err)
 	}
 
 	// Get latest height
 	fmt.Printf("Finding latest block height...\n")
-	prefix := []byte("H:")
-	latestHeight := uint64(0)
-	iter := dbCurrent.NewIterator(util.BytesPrefix(prefix), nil)
-	for iter.Next() {
-		height, err := strconv.ParseUint(string(iter.Key())[len(prefix):], 10, 64)
-		if err != nil {
-			panic(err)
-		}
-		if height > latestHeight {
-			latestHeight = height
-		}
-	}
-	iter.Release()
+	blockStore := store.NewBlockStore(dbOld)
+	latestHeight := blockStore.Height()
 	fmt.Printf("Latest block height [%v]\n", latestHeight)
 
 	// Get blockhash of latest height
 	fmt.Printf("Finding latest block hash...\n")
-	value, err := dbCurrent.Get([]byte("H:"+fmt.Sprint(latestHeight)), nil)
-	if err != nil {
-		panic(err)
-	}
-	protoBlockMeta := new(cmtproto.BlockMeta)
-	if err = proto.Unmarshal(value, protoBlockMeta); err != nil {
-		panic(err)
-	}
-	blockMeta, err := types.BlockMetaFromProto(protoBlockMeta)
-	if err != nil {
-		panic(err)
-	}
-	latestHash := strings.ToLower(blockMeta.BlockID.Hash.String())
+	meta := blockStore.LoadBlockMeta(latestHeight)
+	latestHash := strings.ToLower(meta.BlockID.Hash.String())
 	fmt.Printf("Latest block hash [%v]\n", latestHash)
 
-	// Create new blockstore.db and populate latest height and hash
+	// Create new db and populate latest info
 	fmt.Printf("Creating new db and adding latest info from old db...\n")
 	if err := os.RemoveAll(filepath.Join(dataDir, "blockstore.new.db")); err != nil {
 		panic(err)
 	}
-	dbNew, err := leveldb.OpenFile(filepath.Join(dataDir, "blockstore.new.db"), nil)
+	dbNew, err := cosmosdb.NewGoLevelDB("blockstore.new", dataDir)
 	if err != nil {
 		panic(err)
 	}
@@ -88,45 +64,48 @@ func PruneBlockstoreDB(dataDir string) {
 		blockstoreKey []byte = []byte("blockStore")
 		blockstoreVal []byte
 	)
-	hVal, err = dbCurrent.Get(hKey, nil)
+	hVal, err = dbOld.Get(hKey)
 	if err != nil {
 		panic(err)
 	}
-	cVal, err = dbCurrent.Get(cKey, nil)
+	cVal, err = dbOld.Get(cKey)
 	if err != nil {
 		panic(err)
 	}
-	pVal, err = dbCurrent.Get(pKey, nil)
+	pVal, err = dbOld.Get(pKey)
 	if err != nil {
 		panic(err)
 	}
-	scVal, err = dbCurrent.Get(scKey, nil)
+	scVal, err = dbOld.Get(scKey)
 	if err != nil {
 		panic(err)
 	}
-	bhVal, err = dbCurrent.Get(bhKey, nil)
+	bhVal, err = dbOld.Get(bhKey)
 	if err != nil {
 		panic(err)
 	}
-	blockstoreVal, err = dbCurrent.Get(blockstoreKey, nil)
+	blockstoreVal, err = dbOld.Get(blockstoreKey)
 	if err != nil {
 		panic(err)
 	}
-	batch := new(leveldb.Batch)
-	batch.Put(hKey, hVal)
-	batch.Put(cKey, cVal)
-	batch.Put(pKey, pVal)
-	batch.Put(scKey, scVal)
-	batch.Put(bhKey, bhVal)
-	batch.Put(blockstoreKey, blockstoreVal)
-	if err := dbNew.Write(batch, nil); err != nil {
+	batch := dbNew.NewBatch()
+	batch.Set(hKey, hVal)
+	batch.Set(cKey, cVal)
+	batch.Set(pKey, pVal)
+	batch.Set(scKey, scVal)
+	batch.Set(bhKey, bhVal)
+	batch.Set(blockstoreKey, blockstoreVal)
+	if err := batch.WriteSync(); err != nil {
+		panic(err)
+	}
+	if err := batch.Close(); err != nil {
 		panic(err)
 	}
 	fmt.Printf("Successfully added latest info to new blockstore.db\n")
 
 	// Remove old db and rename new db
 	fmt.Printf("Removing old db and renaming new db...\n")
-	if err := dbCurrent.Close(); err != nil {
+	if err := dbOld.Close(); err != nil {
 		panic(err)
 	}
 	if err := dbNew.Close(); err != nil {
@@ -390,6 +369,15 @@ func PruneApplicationDB(dataDir string) {
 	fmt.Printf("Successfully pruned application.db!\n\n")
 }
 
+func ReadDB(dataDir string) {
+	cdb, err := cosmosdb.NewGoLevelDB("blockstore", dataDir)
+	if err != nil {
+		panic(err)
+	}
+	state := store.LoadBlockStoreState(cdb)
+	fmt.Println(state.Height)
+}
+
 func main() {
 	if len(os.Args) != 2 {
 		fmt.Printf("Usage: go run main.go <app_home>\n")
@@ -400,6 +388,6 @@ func main() {
 	fmt.Printf("Using app data dir at [%v]\n\n", dataDir)
 
 	PruneBlockstoreDB(dataDir)
-	PruneStateDB(dataDir)
-	PruneApplicationDB(dataDir)
+	// PruneStateDB(dataDir)
+	// PruneApplicationDB(dataDir)
 }
