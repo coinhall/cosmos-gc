@@ -3,14 +3,13 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
-	"math"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	cosmosdb "github.com/cometbft/cometbft-db"
 	"github.com/cometbft/cometbft/libs/log"
+	"github.com/cometbft/cometbft/state"
 	"github.com/cometbft/cometbft/store"
 	storeiavl "github.com/cosmos/cosmos-sdk/store/iavl"
 	"github.com/cosmos/cosmos-sdk/store/rootmulti"
@@ -18,7 +17,6 @@ import (
 	gogotypes "github.com/cosmos/gogoproto/types"
 	"github.com/cosmos/iavl"
 	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/util"
 )
 
 func PruneBlockstoreDB(dataDir string) {
@@ -101,7 +99,7 @@ func PruneBlockstoreDB(dataDir string) {
 	if err := batch.Close(); err != nil {
 		panic(err)
 	}
-	fmt.Printf("Successfully added latest info to new blockstore.db\n")
+	fmt.Printf("Successfully added latest info to new db\n")
 
 	// Remove old db and rename new db
 	fmt.Printf("Removing old db and renaming new db...\n")
@@ -123,30 +121,21 @@ func PruneBlockstoreDB(dataDir string) {
 func PruneStateDB(dataDir string) {
 	fmt.Printf("=== Pruning state.db ===\n")
 
-	dbCurrent, err := leveldb.OpenFile(filepath.Join(dataDir, "state.db"), nil)
+	dbOld, err := cosmosdb.NewGoLevelDB("state", dataDir)
 	if err != nil {
 		panic(err)
 	}
 
 	// Get latest height
-	fmt.Printf("Finding latest block height...\n")
-	prefix := []byte("validatorsKey:")
-	lowestHeight := uint64(math.MaxUint64)
-	latestHeight := uint64(0)
-	iter := dbCurrent.NewIterator(util.BytesPrefix(prefix), nil)
-	for iter.Next() {
-		height, err := strconv.ParseUint(string(iter.Key())[len(prefix):], 10, 64)
-		if err != nil {
-			panic(err)
-		}
-		if height < lowestHeight {
-			lowestHeight = height
-		}
-		if height > latestHeight {
-			latestHeight = height
-		}
+	fmt.Printf("Finding latest and initial block heights...\n")
+	storeOld := state.NewStore(dbOld, state.StoreOptions{})
+	storeStateOld, err := storeOld.Load()
+	if err != nil {
+		panic(err)
 	}
-	iter.Release()
+	initialheight := storeStateOld.InitialHeight
+	latestHeight := storeStateOld.LastBlockHeight
+	fmt.Printf("Initial block height [%v]\n", initialheight)
 	fmt.Printf("Latest block height [%v]\n", latestHeight)
 
 	// Create new db and populate latest info
@@ -154,70 +143,49 @@ func PruneStateDB(dataDir string) {
 	if err := os.RemoveAll(filepath.Join(dataDir, "state.new.db")); err != nil {
 		panic(err)
 	}
-	dbNew, err := leveldb.OpenFile(filepath.Join(dataDir, "state.new.db"), nil)
+	dbNew, err := cosmosdb.NewGoLevelDB("state.new", dataDir)
 	if err != nil {
+		panic(err)
+	}
+	storeNew := state.NewStore(dbNew, state.StoreOptions{})
+	if err := storeNew.Save(storeStateOld); err != nil {
 		panic(err)
 	}
 	var (
-		abciResponsesKey    []byte = []byte("abciResponsesKey:" + fmt.Sprint(latestHeight-2))
-		abciResponsesVal    []byte
-		consensusParamsKey  []byte = []byte("consensusParamsKey:" + fmt.Sprint(latestHeight-1))
-		consensusParamsVal  []byte
-		genesisDocKey       []byte = []byte("genesisDoc")
-		genesisDocVal       []byte
-		lastABCIResponseKey []byte = []byte("lastABCIResponseKey")
-		lastABCIResponseVal []byte
-		stateKey            []byte = []byte("stateKey")
-		stateVal            []byte
+		validatorsKey0 []byte = []byte("validatorsKey:" + fmt.Sprint(initialheight))
+		validatorsVal0 []byte
+		validatorsKey1 []byte = []byte("validatorsKey:" + fmt.Sprint(latestHeight))
+		validatorsVal1 []byte
+		validatorsKey2 []byte = []byte("validatorsKey:" + fmt.Sprint(latestHeight+1))
+		validatorsVal2 []byte
 	)
-	abciResponsesVal, err = dbCurrent.Get(abciResponsesKey, nil)
+	validatorsVal0, err = dbOld.Get(validatorsKey0)
 	if err != nil {
 		panic(err)
 	}
-	consensusParamsVal, err = dbCurrent.Get(consensusParamsKey, nil)
+	validatorsVal1, err = dbOld.Get(validatorsKey1)
 	if err != nil {
 		panic(err)
 	}
-	genesisDocVal, err = dbCurrent.Get(genesisDocKey, nil)
+	validatorsVal2, err = dbOld.Get(validatorsKey2)
 	if err != nil {
 		panic(err)
 	}
-	lastABCIResponseVal, err = dbCurrent.Get(lastABCIResponseKey, nil)
-	if err != nil {
+	batch := dbNew.NewBatch()
+	batch.Set(validatorsKey0, validatorsVal0)
+	batch.Set(validatorsKey1, validatorsVal1)
+	batch.Set(validatorsKey2, validatorsVal2)
+	if err := batch.WriteSync(); err != nil {
 		panic(err)
 	}
-	stateVal, err = dbCurrent.Get(stateKey, nil)
-	if err != nil {
+	if err := batch.Close(); err != nil {
 		panic(err)
 	}
-	// ! we need to get the first height of a hard fork
-	// ! the first ever key found in the db might be wrong
-	firstValidatorsVal, err := dbCurrent.Get([]byte("validatorsKey:"+fmt.Sprint(lowestHeight)), nil)
-	if err != nil {
-		panic(err)
-	}
-	batch := new(leveldb.Batch)
-	batch.Put(abciResponsesKey, abciResponsesVal)
-	batch.Put(consensusParamsKey, consensusParamsVal)
-	batch.Put(genesisDocKey, genesisDocVal)
-	batch.Put(lastABCIResponseKey, lastABCIResponseVal)
-	batch.Put(stateKey, stateVal)
-	batch.Put([]byte("validatorsKey:"+fmt.Sprint(lowestHeight)), firstValidatorsVal)
-	for i := 0; i <= 2; i++ {
-		key := []byte("validatorsKey:" + fmt.Sprint(latestHeight-uint64(i)))
-		val, err := dbCurrent.Get(key, nil)
-		if err != nil {
-			panic(err)
-		}
-		batch.Put(key, val)
-	}
-	if err := dbNew.Write(batch, nil); err != nil {
-		panic(err)
-	}
-	fmt.Printf("Successfully added latest info to new state.db\n")
+	fmt.Printf("Successfully added latest info to new db\n")
 
 	// Remove old db and rename new db
-	if err := dbCurrent.Close(); err != nil {
+	fmt.Printf("Removing old db and renaming new db...\n")
+	if err := dbOld.Close(); err != nil {
 		panic(err)
 	}
 	if err := dbNew.Close(); err != nil {
@@ -369,15 +337,6 @@ func PruneApplicationDB(dataDir string) {
 	fmt.Printf("Successfully pruned application.db!\n\n")
 }
 
-func ReadDB(dataDir string) {
-	cdb, err := cosmosdb.NewGoLevelDB("blockstore", dataDir)
-	if err != nil {
-		panic(err)
-	}
-	state := store.LoadBlockStoreState(cdb)
-	fmt.Println(state.Height)
-}
-
 func main() {
 	if len(os.Args) != 2 {
 		fmt.Printf("Usage: go run main.go <app_home>\n")
@@ -388,6 +347,6 @@ func main() {
 	fmt.Printf("Using app data dir at [%v]\n\n", dataDir)
 
 	PruneBlockstoreDB(dataDir)
-	// PruneStateDB(dataDir)
-	// PruneApplicationDB(dataDir)
+	PruneStateDB(dataDir)
+	PruneApplicationDB(dataDir)
 }
